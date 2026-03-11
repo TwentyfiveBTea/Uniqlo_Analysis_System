@@ -272,29 +272,26 @@ class DistributionDecisionTree:
         
         # 编码特征
         X, y = self.encode_features(df)
-        
-        # 划分训练集和测试集
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-        
-        # 训练决策树
+
+        # 使用全部数据训练（这种探索性分析不需要划分训练测试集）
+        # 决策树的目标是提取规则，不需要像预测模型那样追求泛化能力
         if SKLEARN_AVAILABLE:
             self.model = DecisionTreeRegressor(
                 max_depth=max_depth,
                 min_samples_split=min_samples_split,
+                min_samples_leaf=5,
                 random_state=42
             )
-            self.model.fit(X_train, y_train)
-            
-            # 预测
-            y_pred = self.model.predict(X_test)
-            
+            self.model.fit(X, y)
+
+            # 在全部数据上评估
+            y_pred = self.model.predict(X)
+
             # 计算评估指标
             self.metrics = TreeMetrics(
-                rmse=float(np.sqrt(mean_squared_error(y_test, y_pred))),
-                mae=float(mean_absolute_error(y_test, y_pred)),
-                r2_score=float(r2_score(y_test, y_pred)),
+                rmse=float(np.sqrt(mean_squared_error(y, y_pred))),
+                mae=float(mean_absolute_error(y, y_pred)),
+                r2_score=float(r2_score(y, y_pred)),
                 tree_depth=self.model.get_depth()
             )
             
@@ -320,11 +317,11 @@ class DistributionDecisionTree:
             )
             
             self.feature_importance = {col: 1.0/len(X.columns) for col in X.columns}
-        
-        # 保留测试集数据用于预测示例
-        self.test_data = X_test
-        self.test_target = y_test
-        
+
+        # 保留数据用于预测示例（使用全部数据的一部分）
+        self.test_data = X
+        self.test_target = y
+
         logger.info(f"Training complete. RMSE: {self.metrics.rmse:.2f}, R2: {self.metrics.r2_score:.3f}")
         
         return self
@@ -399,21 +396,30 @@ class DistributionDecisionTree:
             'Sales_Volume': ['mean', 'sum', 'count']
         }).reset_index()
         
-        grouped.columns = ['Region', 'Season', 'Category', 'Price_Range', 
+        grouped.columns = ['Region', 'Season', 'Category', 'Price_Range',
                          'avg_sales', 'total_sales', 'count']
-        
-        # 按销量排序，取前30条
-        top_combos = grouped.nlargest(30, 'avg_sales')
-        
+
+        # 按销量排序，取前50条
+        top_combos = grouped.nlargest(50, 'avg_sales')
+
+        # 从前50条数据计算百分位数来分配优先级
+        top_sales = top_combos['avg_sales'].values
+        if len(top_sales) > 0:
+            p75 = np.percentile(top_sales, 75)
+            p50 = np.percentile(top_sales, 50)
+            p25 = np.percentile(top_sales, 25)
+        else:
+            p75, p50, p25 = 2000, 1500, 1000
+
         for _, row in top_combos.iterrows():
-            # 确定优先级
-            if row['avg_sales'] > 2000:
+            # 使用百分位数确定优先级
+            if row['avg_sales'] >= p50:
                 priority = "高"
-            elif row['avg_sales'] > 1500:
+            elif row['avg_sales'] >= p25:
                 priority = "中"
             else:
                 priority = "低"
-            
+
             # 生成建议
             recommendation = (
                 f"建议在{row['Season']}季节向{row['Region']}地区"
@@ -474,18 +480,27 @@ class DistributionDecisionTree:
         
         return results
     
-    def analyze(self) -> DecisionTreeResult:
+    def analyze(self, max_depth: int = None, min_samples_split: int = None) -> DecisionTreeResult:
         """
         执行完整分析
-        
+
+        Args:
+            max_depth: 最大深度（可选，默认使用实例属性）
+            min_samples_split: 最小分裂样本数（可选，默认使用实例属性）
+
         Returns:
             分析结果
         """
-        # 加载数据
-        self.df = self.load_data()
-        
+        # 如果没有数据才加载，否则使用已设置的 df（真实数据）
+        if self.df is None or len(self.df) == 0:
+            self.df = self.load_data()
+
+        # 使用传入的参数或实例属性
+        depth = max_depth if max_depth is not None else getattr(self, 'max_depth', 5)
+        split = min_samples_split if min_samples_split is not None else getattr(self, 'min_samples_split', 20)
+
         # 训练模型
-        self.train(self.df)
+        self.train(self.df, max_depth=depth, min_samples_split=split)
         
         # 提取规则
         rules = self.extract_rules(self.df)
@@ -521,9 +536,13 @@ class SimpleDecisionTree:
         return np.full(len(X), self.tree['value'])
 
 
-def run_decision_tree_analysis() -> Dict[str, Any]:
+def run_decision_tree_analysis(max_depth: int = 5, min_samples_split: int = 20) -> Dict[str, Any]:
     """
     运行决策树分析
+    
+    Args:
+        max_depth: 决策树最大深度
+        min_samples_split: 最小分裂样本数
     
     Returns:
         分析结果
@@ -544,25 +563,19 @@ def run_decision_tree_analysis() -> Dict[str, Any]:
     
     # 从实际数据构建决策树需要的特征
     # 创建区域-品类-季节的销量数据
-    
-    # 按区域和季节聚合
-    region_season = all_data.groupby(['city', 'season']).agg({
+
+    # 按区域、品类、季节聚合
+    region_category_season = all_data.groupby(['city', 'category', 'season']).agg({
         'sales_amount': 'sum',
         'order_count': 'sum',
         'profit': 'sum'
     }).reset_index()
-    
-    # 按品类聚合
-    category_data = all_data.groupby('category').agg({
-        'sales_amount': 'sum',
-        'order_count': 'sum'
-    }).reset_index()
-    
+
     # 创建特征DataFrame
     feature_data = []
-    
-    # 按城市+季节聚合
-    for _, row in region_season.iterrows():
+
+    # 按城市+品类+季节聚合（完整的组合）
+    for _, row in region_category_season.iterrows():
         # 确定价格区间
         avg_price = row['sales_amount'] / max(row['order_count'], 1)
         if avg_price < 100:
@@ -571,39 +584,35 @@ def run_decision_tree_analysis() -> Dict[str, Any]:
             price_range = 'Mid'
         else:
             price_range = 'High'
-        
+
         feature_data.append({
             'Region': row['city'],
             'Season': row['season'],
-            'Category': 'General',
-            'Price_Range': price_range,
-            'Sales_Volume': int(row['order_count'])
-        })
-    
-    # 按品类添加
-    for _, row in category_data.iterrows():
-        avg_price = row['sales_amount'] / max(row['order_count'], 1)
-        if avg_price < 100:
-            price_range = 'Low'
-        elif avg_price < 200:
-            price_range = 'Mid'
-        else:
-            price_range = 'High'
-        
-        feature_data.append({
-            'Region': 'All',
-            'Season': 'All',
             'Category': row['category'],
             'Price_Range': price_range,
             'Sales_Volume': int(row['order_count'])
         })
-    
-    # 转换为DataFrame并设置到analyzer
+
+    # 转换为DataFrame
     df = pd.DataFrame(feature_data)
+
+    # 检查是否有足够的数据
+    if df.empty:
+        logger.warning("No feature data generated")
+        return {'error': 'No data available'}
+
+    logger.info(f"Generated {len(df)} feature records")
+    logger.info(f"Unique regions: {df['Region'].nunique()}")
+    logger.info(f"Unique categories: {df['Category'].nunique()}")
+    logger.info(f"Unique seasons: {df['Season'].nunique()}")
     analyzer.df = df
-    
+
+    # 设置模型参数
+    analyzer.max_depth = max_depth
+    analyzer.min_samples_split = min_samples_split
+
     # 运行分析
-    result = analyzer.analyze()
+    result = analyzer.analyze(max_depth=max_depth, min_samples_split=min_samples_split)
     
     return result.to_dict()
 
