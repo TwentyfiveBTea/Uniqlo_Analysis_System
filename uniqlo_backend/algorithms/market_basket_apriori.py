@@ -204,8 +204,21 @@ class AprioriAnalyzer:
         Returns:
             支持度
         """
-        count = sum(1 for trans in self.transactions if itemset.issubset(set(trans)))
-        return count / len(self.transactions) if self.transactions else 0
+        # 支持 DataFrame 和 list 两种格式
+        if isinstance(self.transactions, pd.DataFrame):
+            # DataFrame 格式：检查每行是否包含所有项
+            items_list = list(itemset)
+            if all(col in self.transactions.columns for col in items_list):
+                # 统计包含所有项的交易数
+                mask = self.transactions[items_list].all(axis=1)
+                count = int(mask.sum())
+            else:
+                count = 0
+            return count / len(self.transactions) if len(self.transactions) > 0 else 0
+        else:
+            # list 格式
+            count = sum(1 for trans in self.transactions if itemset.issubset(set(trans)))
+            return count / len(self.transactions) if self.transactions else 0
     
     def _generate_candidates(self, prev_frequent: List[Set[str]], k: int) -> List[Set[str]]:
         """
@@ -460,28 +473,22 @@ def run_apriori_analysis(min_support: float = 0.01,
     if all_data.empty:
         logger.warning("No data available for Apriori analysis")
         return {'error': 'No data available'}
-    
-    # 按订单/客户构建交易basket
-    # 将每个订单的所有产品作为一个basket
-    
+
+    # 按城市+日期构建交易basket（减少交易数量以提高性能）
     transactions = []
-    
-    # 按订单日期+商店+客户聚合，构建交易basket
-    order_groups = all_data.groupby(['order_date', 'store_id', 'customer_count'])
-    
-    for (order_date, store_id, customer_count), group in order_groups:
-        # 获取该订单中的所有品类
+
+    for (order_date, city), group in all_data.groupby(['order_date', 'city']):
         categories = group['category'].dropna().unique().tolist()
         if categories and len(categories) > 0:
             transactions.append(categories)
-    
-    # 如果没有足够的交易，使用品类共现
-    if len(transactions) < 10:
-        # 按城市+日期构建
-        for (order_date, city), group in all_data.groupby(['order_date', 'city']):
-            categories = group['category'].dropna().unique().tolist()
-            if categories and len(categories) > 0:
-                transactions.append(categories)
+
+    # 限制交易数量以提高性能（随机采样或取最近的）
+    max_transactions = 50000
+    if len(transactions) > max_transactions:
+        transactions = transactions[:max_transactions]
+        logger.info(f"Limited transactions to {max_transactions} for performance")
+
+    logger.info(f"Using {len(transactions)} transactions for Apriori analysis")
     
     # 转换格式为DataFrame（每行一个交易，每列一个商品）
     # 首先对transactions进行编码
@@ -503,11 +510,59 @@ def run_apriori_analysis(min_support: float = 0.01,
         # 设置到analyzer
         analyzer.transactions = df
         analyzer.all_items = list(all_categories)
-    
-    # 运行分析
-    result = analyzer.analyze(min_support, min_confidence)
-    
-    return result.to_dict()
+
+        # 初始化 item_counts（从 DataFrame 计算）
+        from collections import Counter
+        analyzer.item_counts = Counter()
+        for col in df.columns:
+            analyzer.item_counts[col] = int(df[col].sum())
+
+        # 直接运行分析
+        import time
+        start_time = time.time()
+
+        # 挖掘频繁项集
+        frequent_itemsets = analyzer.find_frequent_itemsets(min_support, max_length=3)
+
+        # 只处理项集大小<=3的频繁项集（减少规则生成时间）
+        filtered_itemsets = [item for item in frequent_itemsets if len(item.items) <= 3]
+
+        # 生成关联规则
+        rules = analyzer.generate_rules(filtered_itemsets, min_confidence)
+
+        # 按提升度排序
+        rules = sorted(rules, key=lambda x: x.lift, reverse=True)
+
+        execution_time = time.time() - start_time
+
+        logger.info(f"Apriori analysis complete in {execution_time:.2f}s")
+
+        # 构建返回结果 - 返回更多规则和频繁项集
+        result = {
+            'frequent_itemsets': [
+                {
+                    'items': list(itemset.items),
+                    'support': float(itemset.support)
+                }
+                for itemset in frequent_itemsets[:50]  # 增加返回数量
+            ],
+            'association_rules': [
+                {
+                    'antecedent': list(rule.antecedent),
+                    'consequent': list(rule.consequent),
+                    'support': float(rule.support),
+                    'confidence': float(rule.confidence),
+                    'lift': float(rule.lift)
+                }
+                for rule in rules[:50]  # 增加返回数量
+            ],
+            'min_support': min_support,
+            'min_confidence': min_confidence,
+            'total_transactions': len(transactions),
+            'execution_time': execution_time
+        }
+
+        return result
 
 
 # ============================================================================
