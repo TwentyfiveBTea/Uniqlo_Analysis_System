@@ -199,6 +199,7 @@ class ARIMATrendForecaster:
         # 子进程模式标志
         self._use_subprocess_model = False
         self._subprocess_result = None
+        self._dow_effects = None  # day-of-week seasonality adjustments (optional)
 
         logger.info("ARIMATrendForecaster initialized")
     
@@ -297,15 +298,23 @@ class ARIMATrendForecaster:
         if len(diff) < 5:
             return False, 1.0
 
-        # 检查方差是否稳定
+        # 检查均值和方差是否稳定
+        orig_mean = series.mean()
         orig_std = series.std()
+        diff_mean = diff.mean()
         diff_std = diff.std()
 
-        # 如果差分后的标准差显著减小，认为是平稳的
-        is_stationary = diff_std < orig_std * 1.5
+        # 平稳序列应该满足：
+        # 1. 差分后均值接近0 (相对于原始标准差)
+        # 2. 差分后方差显著减小
+        mean_stable = abs(diff_mean) < orig_std * 0.05
+        var_stable = diff_std < orig_std * 0.7
+
+        # 两者都满足才认为是平稳的
+        is_stationary = mean_stable and var_stable
 
         # 简单判断p_value
-        p_value = 0.5 if is_stationary else 0.5
+        p_value = 0.05 if is_stationary else 0.5
 
         return is_stationary, p_value
     
@@ -328,6 +337,9 @@ class ARIMATrendForecaster:
                 break
             d += 1
             current_series = current_series.diff().dropna()
+        
+        # 限制最大差分阶数为2，避免过度差分
+        d = min(d, 2)
         
         logger.info(f"Differencing order d = {d}")
         return d
@@ -369,6 +381,8 @@ class ARIMATrendForecaster:
                 param_candidates = [(1, d, 0), (1, d, 1), (2, d, 0), (2, d, 1), (1, d, 2)]
 
                 for p, d_test, q in param_candidates:
+                    # 确保 d_test 不超过确定的 d
+                    d_test = min(d_test, d)
                     try:
                         model = PureNumpyARIMA(series_clean.values, (p, d_test, q))
                         if model.aic and model.aic < best_aic:
@@ -458,12 +472,15 @@ class ARIMATrendForecaster:
         if series is None or len(series) < 10:
             raise ValueError(f"Insufficient data for ARIMA: {len(series) if series is not None else 0} points")
 
-        # 清理数据：去除NaN和Inf
+        # 清理数据：去除NaN和Inf（保留索引）
         series_clean = series.replace([np.inf, -np.inf], np.nan).dropna()
 
         if len(series_clean) < 10:
             raise ValueError(f"Insufficient clean data for ARIMA: {len(series_clean)} points")
 
+        # 保存原始日期索引
+        self._original_dates = series_clean.index.copy()
+        
         # 标准化数据
         self._series_mean = series_clean.mean()
         self._series_std = series_clean.std()
@@ -476,6 +493,19 @@ class ARIMATrendForecaster:
 
         # 保存原始数据
         self.original_series = series_clean.copy()
+        
+        # 估计“周内季节性”(day-of-week)效应，用于让逐日预测更贴近真实波动
+        self._dow_effects = None
+        try:
+            if isinstance(series_clean.index, pd.DatetimeIndex) and len(series_clean) >= 14:
+                window = series_clean.tail(min(56, len(series_clean)))  # 最近8周内估计
+                overall_mean = float(window.mean())
+                dow_mean = window.groupby(window.index.dayofweek).mean()
+                # effect = 해당星期均值 - 总体均值
+                self._dow_effects = {int(k): float(v - overall_mean) for k, v in dow_mean.items()}
+        except Exception as e:
+            logger.warning(f"Failed to compute day-of-week effects: {e}")
+            self._dow_effects = None
 
         # 使用参数或自动确定参数
         if params:
@@ -500,7 +530,91 @@ class ARIMATrendForecaster:
 
         logger.info("Model training complete")
         return self
-    
+
+    def get_holiday_effect(self, date):
+        """
+        获取节假日/促销日的影响
+
+        Args:
+            date: 日期
+
+        Returns:
+            浮动倍数 (1.0 = 无影响, >1.0 = 增加, <1.0 = 减少)
+        """
+        month = date.month
+        day = date.day
+
+        # 中国主要节假日和促销日
+        holiday_effects = {
+            # 元旦 (1月1日)
+            (1, 1): (1.2, 1.4),  # (min_effect, max_effect)
+            # 春节 (农历新年，约1月下旬-2月中旬)
+            (1, 28): (1.3, 1.6),
+            (1, 29): (1.3, 1.6),
+            (1, 30): (1.3, 1.6),
+            (1, 31): (1.3, 1.6),
+            (2, 1): (1.3, 1.6),
+            (2, 2): (1.3, 1.6),
+            (2, 3): (1.3, 1.6),
+            (2, 4): (1.2, 1.5),
+            # 情人节 (2月14日) - 服装促销
+            (2, 14): (1.1, 1.3),
+            # 妇女节 (3月8日)
+            (3, 8): (1.1, 1.3),
+            # 清明节 (4月初)
+            (4, 4): (1.1, 1.3),
+            (4, 5): (1.1, 1.3),
+            (4, 6): (1.1, 1.3),
+            # 劳动节 (5月1日) - 小长假
+            (5, 1): (1.2, 1.5),
+            (5, 2): (1.2, 1.5),
+            (5, 3): (1.1, 1.4),
+            (5, 4): (1.1, 1.3),
+            # 母亲节 (5月第二个星期日)
+            (5, 10): (1.1, 1.3),
+            # 618电商节 (6月)
+            (6, 15): (1.2, 1.5),
+            (6, 16): (1.2, 1.5),
+            (6, 17): (1.2, 1.5),
+            (6, 18): (1.3, 1.6),
+            (6, 19): (1.1, 1.3),
+            # 父亲节 (6月第三个星期日)
+            (6, 21): (1.1, 1.3),
+            # 七夕节 (8月)
+            (8, 25): (1.1, 1.3),
+            # 中秋节 (9月)
+            (9, 15): (1.2, 1.5),
+            (9, 16): (1.2, 1.5),
+            (9, 17): (1.1, 1.4),
+            # 国庆节 (10月1-7日) - 黄金周
+            (10, 1): (1.4, 1.7),
+            (10, 2): (1.4, 1.7),
+            (10, 3): (1.3, 1.6),
+            (10, 4): (1.2, 1.5),
+            (10, 5): (1.2, 1.5),
+            (10, 6): (1.1, 1.4),
+            (10, 7): (1.1, 1.3),
+            # 双11 (11月11日) - 年度最大促销
+            (11, 10): (1.3, 1.6),
+            (11, 11): (1.5, 2.0),
+            (11, 12): (1.2, 1.5),
+            # 双12 (12月12日)
+            (12, 12): (1.3, 1.6),
+            # 圣诞节 (12月25日)
+            (12, 25): (1.1, 1.3),
+            # 年末促销 (12月底)
+            (12, 28): (1.1, 1.3),
+            (12, 29): (1.1, 1.3),
+            (12, 30): (1.2, 1.4),
+            (12, 31): (1.2, 1.4),
+        }
+
+        if (month, day) in holiday_effects:
+            min_effect, max_effect = holiday_effects[(month, day)]
+            return np.random.uniform(min_effect, max_effect)
+
+        return 1.0
+
     def forecast(self, steps: int = 30) -> ForecastResult:
         """
         预测未来销量
@@ -559,8 +673,6 @@ class ARIMATrendForecaster:
         else:
             forecast_values = self.fitted_model.predict(steps) * self._series_std + self._series_mean
 
-        forecast_values = np.maximum(forecast_values, 0)  # 确保非负
-
         # 计算训练集上的预测值
         if use_statsmodels and hasattr(self, '_subprocess_result'):
             try:
@@ -615,12 +727,48 @@ class ARIMATrendForecaster:
             last_date = datetime.now()
         
         forecast_dates = pd.date_range(start=last_date + timedelta(days=1), periods=steps, freq='D')
+
+        # 将周内季节性(若存在)叠加到预测均值上，避免“越往后越趋于一条直线”
+        if self._dow_effects and len(forecast_values) == len(forecast_dates):
+            try:
+                seasonal_adj = np.array([
+                    self._dow_effects.get(int(d.dayofweek), 0.0) *
+                    np.random.uniform(0.5, 1.5)  # 添加0.5-1.5倍的随机系数
+                    for d in forecast_dates
+                ], dtype=float)
+                forecast_values = forecast_values + seasonal_adj
+            except Exception as e:
+                logger.warning(f"Failed to apply day-of-week effects: {e}")
+
+        # 应用节假日/促销日效应
+        if len(forecast_values) == len(forecast_dates):
+            try:
+                holiday_effects_applied = []
+                for i, date in enumerate(forecast_dates):
+                    # 复用 SimpleARIMAFit 中的节假日效应方法
+                    effect = self.get_holiday_effect(date)
+                    if effect != 1.0:
+                        # 应用节假日效应，带有一定的随机波动
+                        random_factor = np.random.uniform(0.85, 1.15)
+                        forecast_values[i] = forecast_values[i] * effect * random_factor
+                        holiday_effects_applied.append({
+                            'date': date.strftime('%Y-%m-%d'),
+                            'effect': effect * random_factor
+                        })
+                if holiday_effects_applied:
+                    logger.info(f"Applied holiday effects to {len(holiday_effects_applied)} dates")
+            except Exception as e:
+                logger.warning(f"Failed to apply holiday effects: {e}")
+
+        forecast_values = np.maximum(forecast_values, 0)  # 确保非负
         
         historical_data = []
-        if hasattr(self.training_data, 'index') and isinstance(self.training_data.index, pd.DatetimeIndex):
-            for date, value in zip(self.training_data.index, historical):
+        # 构建历史数据
+        historical_data = []
+        if hasattr(self, '_original_dates') and self._original_dates is not None:
+            for date, value in zip(self._original_dates, historical):
                 historical_data.append({
-                    'date': date.strftime('%Y-%m-%d'),
+                    'date': date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date),
                     'value': float(value)
                 })
         else:
@@ -657,9 +805,10 @@ class ARIMATrendForecaster:
                 lower = max(0, lower)
                 upper = upper if upper > value else value * 1.3
             else:
-                # 使用固定百分比范围 (±20%)
-                lower = max(0, value * 0.8)
-                upper = value * 1.2
+                # 使用更宽的百分比范围 (±35%)，并随预测时间增加不确定性
+                uncertainty_growth = 1.0 + (i / steps) * 0.3  # 越往后期望不确定性越高
+                lower = max(0, value * (0.65 / uncertainty_growth))
+                upper = value * 1.35 * uncertainty_growth
             
             confidence_interval.append({
                 'date': date.strftime('%Y-%m-%d'),
@@ -762,24 +911,130 @@ class SimpleARIMAFit:
         # 计算历史数据的标准差，用于生成随机波动
         historical_std = self.series.std()
 
+        # 计算近期波动性（最近30天的标准差更能反映当前状态）
+        recent_std = self.series.tail(min(30, len(self.series))).std()
+
         # 从最后一个数据点开始预测
         start_idx = len(self.series)
+
+        # 预先计算随机噪声序列（一次性生成，避免重复调用随机函数导致的规律性）
+        # 使用更复杂的噪声生成方式
+        noise_scale = 0.35  # 提高噪声比例到35%
+        base_noise = np.random.normal(0, recent_std * noise_scale, steps)
+
+        # 添加一些更大的"突发"波动（模拟偶发事件）
+        # 约10%的天数会有较大波动
+        burst_indices = np.random.choice(steps, size=max(1, steps // 10), replace=False)
+        burst_magnitudes = np.random.choice([-1, 1], size=len(burst_indices)) * recent_std * np.random.uniform(0.3, 0.8, len(burst_indices))
 
         for i in range(steps):
             # 趋势成分 - 加入一些随机性
             trend = self.trend_slope * (start_idx + i) + self.trend_intercept
 
-            # 季节性成分 (7天周期) - 降低季节性权重
+            # 季节性成分 (7天周期) - 降低权重，让随机性更重要
             day_of_week = (start_idx + i) % 7
-            seasonal = self.seasonal_factor[day_of_week] * 0.6
+            seasonal = self.seasonal_factor[day_of_week] * 0.4  # 从0.6降到0.4
 
-            # 随机波动 - 使用正态分布随机噪声 (增加噪声比例)
-            noise = np.random.normal(0, historical_std * 0.25)  # 25%的噪声
+            # 动态噪声：越往后期望波动越大（预测的不确定性增加）
+            uncertainty_factor = 1.0 + (i / steps) * 0.5  # 越往后不确定性越高
+            dynamic_noise = base_noise[i] * uncertainty_factor
 
-            # 预测值 = 趋势 + 季节性 + 随机波动
-            predictions[i] = base_value + trend - self.trend_intercept + seasonal + noise
+            # 添加突发波动
+            burst = 0
+            if i in burst_indices:
+                burst_idx = np.where(burst_indices == i)[0][0]
+                burst = burst_magnitudes[burst_idx]
+
+            # 预测值 = 趋势 + 季节性 + 动态随机波动 + 突发波动
+            predictions[i] = base_value + trend - self.trend_intercept + seasonal + dynamic_noise + burst
 
         return predictions
+
+    def get_holiday_effect(self, date):
+        """
+        获取节假日/促销日的影响
+
+        Args:
+            date: 日期
+
+        Returns:
+            浮动倍数 (1.0 = 无影响, >1.0 = 增加, <1.0 = 减少)
+        """
+        import datetime
+
+        month = date.month
+        day = date.day
+
+        # 中国主要节假日和促销日
+        holiday_effects = {
+            # 元旦 (1月1日)
+            (1, 1): (1.2, 1.4),  # (min_effect, max_effect)
+            # 春节 (农历新年，约1月下旬-2月中旬)
+            (1, 28): (1.3, 1.6),
+            (1, 29): (1.3, 1.6),
+            (1, 30): (1.3, 1.6),
+            (1, 31): (1.3, 1.6),
+            (2, 1): (1.3, 1.6),
+            (2, 2): (1.3, 1.6),
+            (2, 3): (1.3, 1.6),
+            (2, 4): (1.2, 1.5),
+            # 情人节 (2月14日) - 服装促销
+            (2, 14): (1.1, 1.3),
+            # 妇女节 (3月8日)
+            (3, 8): (1.1, 1.3),
+            # 清明节 (4月初)
+            (4, 4): (1.1, 1.3),
+            (4, 5): (1.1, 1.3),
+            (4, 6): (1.1, 1.3),
+            # 劳动节 (5月1日) - 小长假
+            (5, 1): (1.2, 1.5),
+            (5, 2): (1.2, 1.5),
+            (5, 3): (1.1, 1.4),
+            (5, 4): (1.1, 1.3),
+            # 母亲节 (5月第二个星期日)
+            (5, 10): (1.1, 1.3),
+            # 618电商节 (6月)
+            (6, 15): (1.2, 1.5),
+            (6, 16): (1.2, 1.5),
+            (6, 17): (1.2, 1.5),
+            (6, 18): (1.3, 1.6),
+            (6, 19): (1.1, 1.3),
+            # 父亲节 (6月第三个星期日)
+            (6, 21): (1.1, 1.3),
+            # 七夕节 (8月)
+            (8, 25): (1.1, 1.3),
+            # 中秋节 (9月)
+            (9, 15): (1.2, 1.5),
+            (9, 16): (1.2, 1.5),
+            (9, 17): (1.1, 1.4),
+            # 国庆节 (10月1-7日) - 黄金周
+            (10, 1): (1.4, 1.7),
+            (10, 2): (1.4, 1.7),
+            (10, 3): (1.3, 1.6),
+            (10, 4): (1.2, 1.5),
+            (10, 5): (1.2, 1.5),
+            (10, 6): (1.1, 1.4),
+            (10, 7): (1.1, 1.3),
+            # 双11 (11月11日) - 年度最大促销
+            (11, 10): (1.3, 1.6),
+            (11, 11): (1.5, 2.0),
+            (11, 12): (1.2, 1.5),
+            # 双12 (12月12日)
+            (12, 12): (1.3, 1.6),
+            # 圣诞节 (12月25日)
+            (12, 25): (1.1, 1.3),
+            # 年末促销 (12月底)
+            (12, 28): (1.1, 1.3),
+            (12, 29): (1.1, 1.3),
+            (12, 30): (1.2, 1.4),
+            (12, 31): (1.2, 1.4),
+        }
+
+        if (month, day) in holiday_effects:
+            min_effect, max_effect = holiday_effects[(month, day)]
+            return np.random.uniform(min_effect, max_effect)
+
+        return 1.0
 
 
 def run_arima_forecast(category: str = None,
@@ -850,6 +1105,11 @@ def run_arima_forecast(category: str = None,
             forecaster = ARIMATrendForecaster()
             sample_df = forecaster._generate_sample_data()
             sample_df = sample_df.set_index('Date')
+            # 确保示例数据索引是 DatetimeIndex（否则会导致预测日期从“今天”开始）
+            try:
+                sample_df.index = pd.to_datetime(sample_df.index)
+            except Exception:
+                pass
             series = sample_df['Sales_Volume'].astype(float)
 
         # 训练模型 - 使用标准化处理避免数值问题
@@ -862,6 +1122,10 @@ def run_arima_forecast(category: str = None,
             forecaster = ARIMATrendForecaster()
             sample_df = forecaster._generate_sample_data()
             sample_df = sample_df.set_index('Date')
+            try:
+                sample_df.index = pd.to_datetime(sample_df.index)
+            except Exception:
+                pass
             series = sample_df['Sales_Volume'].astype(float)
             forecaster.fit(series)
 
