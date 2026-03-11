@@ -140,20 +140,22 @@ const updateCharts = () => {
       // 获取唯一的地区和品类
       const regions = [...new Set(insights.value.map(i => i.region))]
       const categories = [...new Set(insights.value.map(i => i.category))]
-      
-      // 过滤数据，只显示销量较高的建议
-      const topInsights = insights.value
-        .sort((a, b) => b.expected_sales - a.expected_sales)
-        .slice(0, 20)  // 只显示前20个
-      
-      const heatmapData = []
-      topInsights.forEach(item => {
+
+      // 聚合数据：对每个 region-category 组合，只保留一个值（取最大值）
+      const aggregatedData = {}
+      insights.value.forEach(item => {
         const x = regions.indexOf(item.region)
         const y = categories.indexOf(item.category)
+        const key = `${x}-${y}`
         if (x >= 0 && y >= 0) {
-          heatmapData.push([x, y, item.expected_sales])
+          if (!aggregatedData[key] || item.expected_sales > aggregatedData[key].expected_sales) {
+            aggregatedData[key] = { x, y, expected_sales: item.expected_sales, region: item.region, category: item.category }
+          }
         }
       })
+
+      // 转换为热力图数据格式
+      const heatmapData = Object.values(aggregatedData).map(item => [item.x, item.y, item.expected_sales])
       
       // 确保有数据
       if (regions.length === 0 || categories.length === 0) {
@@ -161,15 +163,17 @@ const updateCharts = () => {
       }
       
       heatmapChart.setOption({
-        tooltip: { 
-          position: 'top', 
-          backgroundColor: '#fff', 
-          borderColor: '#e5e7eb', 
+        tooltip: {
+          position: 'top',
+          backgroundColor: '#fff',
+          borderColor: '#e5e7eb',
           textStyle: { color: '#1a1a1a' },
           formatter: (params) => {
             if (params.data) {
               const [x, y, value] = params.data
-              return `${regions[x]} - ${categories[y]}<br/>预期销量: ${value.toFixed(0)}`
+              const regionName = regions[x]
+              const categoryName = categories[y]
+              return `${regionName} - ${categoryName}<br/>预期销量: ${value.toFixed(0)}`
             }
             return ''
           }
@@ -189,7 +193,7 @@ const updateCharts = () => {
         },
         visualMap: {
           min: 0,
-          max: Math.max(...topInsights.map(i => i.expected_sales), 1),
+          max: Math.max(...heatmapData.map(d => d[2]), 1),
           calculable: true,
           orient: 'horizontal',
           left: 'center',

@@ -86,8 +86,8 @@
         </el-table-column>
         <el-table-column label="价值" width="100">
           <template #default="{ row }">
-            <span class="value-tag" :class="row.lift > 1.5 ? 'high' : row.lift > 1 ? 'mid' : 'low'">
-              {{ row.lift > 1.5 ? '高价值' : row.lift > 1 ? '中等' : '一般' }}
+            <span class="value-tag" :class="row.lift > 1.15 ? 'high' : row.lift > 1.08 ? 'mid' : 'low'">
+              {{ row.lift > 1.15 ? '高价值' : row.lift > 1.08 ? '中等' : '一般' }}
             </span>
           </template>
         </el-table-column>
@@ -143,7 +143,9 @@ const updateCharts = () => {
       if (itemsetChart) itemsetChart.dispose()
       itemsetChart = echarts.init(itemsetChartRef.value)
       
-      const topItemsets = frequentItemsets.value.slice(0, 10)
+      const topItemsets = frequentItemsets.value
+        .filter(i => i.items && i.items.length >= 2)  // 只显示2-3商品组合
+        .slice(0, 10)
       
       itemsetChart.setOption({
         tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, backgroundColor: '#fff', borderColor: '#e5e7eb', textStyle: { color: '#1a1a1a' } },
