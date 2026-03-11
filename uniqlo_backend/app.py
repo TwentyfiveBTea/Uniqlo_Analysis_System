@@ -286,9 +286,9 @@ def decision_tree_analysis():
         min_samples_split = int(params.get('min_samples_split', 20))
         
         logger.info(f"Decision tree analysis request: max_depth={max_depth}")
-        
-        # 运行分析
-        result = run_decision_tree_analysis()
+
+        # 运行分析，传递参数
+        result = run_decision_tree_analysis(max_depth=max_depth, min_samples_split=min_samples_split)
         
         return jsonify(result)
     
